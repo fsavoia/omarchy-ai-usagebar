@@ -78,6 +78,17 @@ owns the local token charts. Remove it with
 - `ui/main.qml` runs the collector every 5 minutes and at startup.
 - Nothing outside `~/.local/state/omarchy/agents/usage/` is touched.
 
+## Uninstall
+
+```bash
+omarchy plugin remove fsavoia.ai-usagebar
+```
+
+Removing the plugin stops the collector. The records it wrote stay in
+`~/.local/state/omarchy/agents/usage/`; delete the ones it created
+(`commandcode.json`, plus any `<vendor>.json` shown in Coverage) to drop the
+tabs immediately.
+
 ## Manual test
 
 ```bash
