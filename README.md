@@ -3,36 +3,48 @@
 Live quota in the native Omarchy agents panel for vendors Omarchy does not
 already cover, sourced from [ai-usagebar](https://github.com/akitaonrails/ai-usagebar).
 
-The Omarchy agents panel (`omarchy.agents`) draws whatever JSON records appear in
-`~/.local/state/omarchy/agents/usage/`. This plugin runs `ai-usagebar usage --json`,
-maps each vendor into that record schema, and writes one record per vendor, so the
-panel renders the meters and the credit balance natively — same look as Claude and
-Codex.
+## Prerequisite — ai-usagebar (required)
 
-## Why
+This plugin **does nothing on its own**. It is an adapter: it reads
+`ai-usagebar usage --json` and translates it into the Omarchy agents-panel
+record format. All authentication and quota fetching — talking to each
+provider's API — is done by ai-usagebar. No ai-usagebar, no data.
 
-Command Code exposes no public quota endpoint, so Omarchy's own collectors cannot
-show its limits. ai-usagebar does know them (5h/weekly/monthly windows plus the
-credit ledger). This plugin pipes that into the panel.
+Install ai-usagebar first (any one):
+
+```bash
+mise use -g github:akitaonrails/ai-usagebar   # no Rust toolchain needed
+cargo install ai-usagebar                      # from source
+# or a prebuilt binary: github.com/akitaonrails/ai-usagebar/releases/latest
+```
+
+Then enable the vendor you want in `~/.config/ai-usagebar/config.toml`:
+
+```toml
+[commandcode]
+enabled = true
+```
+
+Verify ai-usagebar works before installing the plugin:
+
+```bash
+ai-usagebar --vendor commandcode --pretty
+```
+
+If `ai-usagebar` is missing or a vendor is disabled, this plugin writes no
+record for it and the panel simply shows no tab.
 
 ## Requirements
 
-- Omarchy, with the `omarchy.agents` panel in the bar.
-- [ai-usagebar](https://github.com/akitaonrails/ai-usagebar) on `PATH` (or at
-  `~/.local/share/mise/shims/ai-usagebar`).
+- Omarchy, with the `omarchy.agents` bar widget in the layout.
+- ai-usagebar (above), reachable on `PATH` — or at
+  `~/.local/share/mise/shims/ai-usagebar`.
 - `python3`.
 
 ## Install
 
 ```bash
 omarchy plugin add https://github.com/fsavoia/omarchy-ai-usagebar.git --enable
-```
-
-Enable the vendors you want in ai-usagebar's config (`~/.config/ai-usagebar/config.toml`):
-
-```toml
-[commandcode]
-enabled = true
 ```
 
 ## Coverage
