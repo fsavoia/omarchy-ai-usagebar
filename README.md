@@ -3,6 +3,8 @@
 Live quota in the native Omarchy agents panel for vendors Omarchy does not
 already cover, sourced from [ai-usagebar](https://github.com/akitaonrails/ai-usagebar).
 
+![The Command Code tab in the Omarchy agents panel](./preview.png)
+
 ## Prerequisite — ai-usagebar (required)
 
 This plugin **does nothing on its own**. It is an adapter: it reads
