@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "fsavoia.ai-usagebar",
+  "name": "AI Usage (ai-usagebar)",
+  "version": "1.0.0",
+  "author": "Felipe Savoia",
+  "description": "Live quota and credits from ai-usagebar as native tabs in the Omarchy agents panel.",
+  "homepage": "https://github.com/fsavoia/omarchy-ai-usagebar",
+  "license": "MIT",
+  "kinds": ["panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "ui/main.qml"
+  }
+}
