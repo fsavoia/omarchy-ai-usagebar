@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "fsavoia.commandcode-usage",
-  "name": "Command Code Usage",
+  "name": "Command Code Meter",
   "version": "1.0.0",
   "author": "Felipe Savoia",
   "description": "Your live Command Code quota and credits as a native tab in the Omarchy agents panel.",
