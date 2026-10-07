@@ -1,0 +1,302 @@
+#!/usr/bin/python3
+# omarchy:summary=Write the Command Code agents-panel record
+# omarchy:args=[--write]
+"""Command Code (.ai) subscription usage for the Omarchy agents panel.
+
+The Omarchy agents panel (omarchy.agents) draws whatever JSON records appear
+in ~/.local/state/omarchy/agents/usage/. This talks to Command Code's own
+billing API and writes a single record for it, so the subscription's rolling
+spend windows, plan and credit balance show up as a native tab.
+
+No third-party tool is involved. The credential is the one your Command Code
+harness already holds; it is only ever read, never refreshed or written back.
+
+Endpoints (https://api.commandcode.ai, Bearer auth):
+  GET /alpha/whoami                 -> org.id (optional account scope)
+  GET /alpha/billing/credits        -> credit ledger + fiveHour/weekly windows
+  GET /alpha/billing/subscriptions  -> plan id + billing period end
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE_URL = "https://api.commandcode.ai"
+VERSION = "1.0.0"
+WHOAMI_PATH = "/alpha/whoami"
+CREDITS_PATH = "/alpha/billing/credits"
+SUBSCRIPTIONS_PATH = "/alpha/billing/subscriptions"
+HTTP_TIMEOUT = 10
+
+# Credential files searched in order; the first holding a live credential wins.
+AUTH_FILES = ((".commandcode", "auth.json"), (".pi", "agent", "auth.json"))
+CREDENTIAL_KEYS = ("command-code", "commandcode")
+
+# Monthly credit allowance per plan, in USD. The API reports credit remaining
+# but never the plan's ceiling, so the "spent of allowance" line needs this
+# table. An unknown plan simply omits that line rather than guessing.
+PLAN_CREDITS = {
+    "individual-go": 10.0,
+    "individual-goat": 70.0,
+    "individual-pro": 30.0,
+    "individual-pro-v1": 80.0,
+    "individual-provider": 15.0,
+    "individual-max": 150.0,
+    "individual-ultra": 300.0,
+    "teams-pro": 40.0,
+}
+
+# Display label per plan id, matching what Command Code's own /usage shows.
+PLAN_LABELS = {
+    "individual-go": "Go",
+    "individual-goat": "GOAT",
+    "individual-pro": "Pro",
+    "individual-pro-v1": "Pro",
+    "individual-provider": "Provider",
+    "individual-max": "Max",
+    "individual-ultra": "Ultra",
+    "teams-pro": "Teams Pro",
+}
+
+
+def usage_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    return Path(base) / "omarchy" / "agents" / "usage"
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _candidate(value):
+    """A token string plus an optional millisecond expiry, from either shape."""
+    if isinstance(value, str):
+        token = value.strip()
+        return (token, None) if token else None
+    if isinstance(value, dict):
+        for field in ("access", "apiKey", "key"):
+            token = value.get(field)
+            if isinstance(token, str) and token.strip():
+                expires = value.get("expires")
+                return token.strip(), expires if isinstance(expires, int) else None
+    return None
+
+
+def _read_credential(path: Path, allow_generic: bool):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = []
+    for key in CREDENTIAL_KEYS:
+        if key in data:
+            found.append(_candidate(data[key]))
+    # `apiKey` is unkeyed: only trust it in Command Code's own file, where the
+    # whole document is Command Code's. A shared harness keystore holds every
+    # provider, so an unkeyed key there is not ours to read.
+    if allow_generic and "apiKey" in data:
+        found.append(_candidate(data["apiKey"]))
+    for candidate in found:
+        if candidate is None:
+            continue
+        token, expires = candidate
+        if expires is not None and 0 < expires <= _now_ms():
+            continue
+        return token
+    return None
+
+
+def resolve_token():
+    env = os.environ.get("COMMANDCODE_API_KEY", "").strip()
+    if env:
+        return env
+    home = Path.home()
+    for rel in AUTH_FILES:
+        path = home.joinpath(*rel)
+        token = _read_credential(path, allow_generic=len(rel) == 2)
+        if token:
+            return token
+    raise SystemExit(
+        "Command Code is not signed in. Run `commandcode` and sign in, "
+        "or set COMMANDCODE_API_KEY."
+    )
+
+
+def get_json(token: str, path: str, org_id=None):
+    url = BASE_URL + path
+    if org_id:
+        url += "?orgId=" + urllib.parse.quote(org_id)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/json",
+            # Cloudflare rejects the default Python-urllib user agent.
+            "User-Agent": "commandcode-omarchy/" + VERSION,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise SystemExit(
+                "Command Code sign-in was rejected. Run `commandcode` to sign in again."
+            )
+        raise SystemExit("Command Code billing request failed (HTTP %d)" % exc.code)
+    except urllib.error.URLError as exc:
+        raise SystemExit("Command Code is unreachable: %s" % exc.reason)
+
+
+def clamp_percent(used, cap) -> float:
+    try:
+        used, cap = float(used), float(cap)
+    except (TypeError, ValueError):
+        return 0.0
+    if cap <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, used / cap)), 4)
+
+
+def parse_reset(value):
+    """Resets arrive as millisecond epochs; accept a string too."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        )[:-4] + "Z"
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return ""
+
+
+def build_record(credits_doc, subscription=None) -> dict:
+    root = credits_doc if isinstance(credits_doc, dict) else {}
+    ledger = root.get("credits") if isinstance(root.get("credits"), dict) else {}
+    windows = root.get("windowLimits")
+    if not isinstance(windows, dict):
+        windows = ledger.get("windowLimits") if isinstance(ledger, dict) else None
+    windows = windows or {}
+
+    monthly = ledger.get("monthlyCredits") or 0.0
+    purchased = ledger.get("purchasedCredits") or 0.0
+    free = ledger.get("freeCredits") or 0.0
+    remaining = float(monthly) + float(purchased) + float(free)
+
+    plan_id = ""
+    period_end = ""
+    if isinstance(subscription, dict):
+        data = subscription.get("data") if isinstance(subscription.get("data"), dict) else {}
+        raw_id = data.get("planId")
+        if isinstance(raw_id, str) and raw_id.strip():
+            plan_id = raw_id.strip()
+        raw_period = data.get("currentPeriodEnd")
+        if isinstance(raw_period, str) and raw_period.strip():
+            period_end = raw_period.strip()
+
+    label = PLAN_LABELS.get(plan_id, plan_id)
+    pool = PLAN_CREDITS.get(plan_id)
+
+    limits = []
+    for key, name in (("fiveHour", "Session (5h)"), ("weekly", "Weekly")):
+        window = windows.get(key)
+        if isinstance(window, dict):
+            limits.append({
+                "label": name,
+                "percent": clamp_percent(window.get("used"), window.get("cap")),
+                "resetsAt": parse_reset(window.get("resetAt")),
+            })
+    if pool is not None:
+        limits.append({
+            "label": "Monthly",
+            "percent": clamp_percent(max(0.0, pool - remaining), pool),
+            "resetsAt": period_end,
+        })
+
+    record = {
+        "schemaVersion": 1,
+        "id": "commandcode",
+        "name": "Command Code",
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True,
+        "hasLocalStats": False,
+        "hasPromptStats": False,
+        "scope": "account",
+        "tierLabel": ("Command Code " + label).strip(),
+        "usageStatusText": "",
+        "authHelpText": "",
+        "limits": limits,
+    }
+    if pool is not None:
+        record["balance"] = {
+            "remaining": round(remaining, 4),
+            "funded": round(pool, 4),
+            "spent": round(max(0.0, pool - remaining), 4),
+            "currency": "USD",
+        }
+    return record
+
+
+def collect() -> list:
+    token = resolve_token()
+    org_id = None
+    try:
+        whoami = get_json(token, WHOAMI_PATH)
+        org = whoami.get("org") if isinstance(whoami, dict) else None
+        if isinstance(org, dict) and isinstance(org.get("id"), str):
+            org_id = org["id"]
+    except SystemExit:
+        pass  # a personal account has no org; only scoping is lost
+
+    credits = get_json(token, CREDITS_PATH, org_id)
+    subscription = None
+    try:
+        subscription = get_json(token, SUBSCRIPTIONS_PATH, org_id)
+    except SystemExit:
+        pass  # plan is presentation detail; the windows still render
+
+    root = credits if isinstance(credits, dict) else {}
+    ledger = root.get("credits") if isinstance(root.get("credits"), dict) else {}
+    windows = root.get("windowLimits")
+    if not isinstance(windows, dict):
+        windows = ledger.get("windowLimits") if isinstance(ledger, dict) else None
+    if not windows and not ledger:
+        raise SystemExit("Command Code billing response had no windows or ledger")
+    return [build_record(credits, subscription)]
+
+
+def write_records(records: list, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for record in records:
+        handle, tmp = tempfile.mkstemp(dir=str(directory), prefix="." + record["id"] + ".")
+        with os.fdopen(handle, "w") as fh:
+            json.dump(record, fh, separators=(",", ":"), sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, directory / (record["id"] + ".json"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true", help="write the record into the Omarchy usage directory")
+    args = parser.parse_args()
+    records = collect()
+    if args.write:
+        write_records(records, usage_dir())
+    else:
+        for record in records:
+            print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
